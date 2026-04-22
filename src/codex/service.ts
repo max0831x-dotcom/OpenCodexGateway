@@ -1,3 +1,10 @@
+/**
+ * Codex 服務 - 核心整合層
+ * 管理 Codex SDK、執行緒、訊息處理
+ */
+
+import { CodexSDKWrapper, CodexResult } from './sdk-wrapper';
+import { ThreadManager } from './thread-manager';
 import { Logger } from '../utils/logger';
 
 export interface CodexServiceOptions {
@@ -5,75 +12,122 @@ export interface CodexServiceOptions {
   model: string;
 }
 
-interface CodexThread {
-  id: string;
-  lastActivity: Date;
-}
-
 export class CodexService {
-  private threads: Map<string, CodexThread> = new Map();
-  private codex: any = null;
+  private sdk: CodexSDKWrapper;
+  private threadManager: ThreadManager;
   private logger: Logger;
   private options: CodexServiceOptions;
 
   constructor(options: CodexServiceOptions) {
     this.options = options;
+    this.sdk = new CodexSDKWrapper({
+      model: options.model,
+      timeout: options.timeout,
+    });
+    this.threadManager = new ThreadManager(options.model);
     this.logger = new Logger('CodexService');
   }
 
-  async process(userId: string, message: string, workingDir?: string): Promise<string> {
+  async initialize(): Promise<boolean> {
+    return this.sdk.initialize();
+  }
+
+  async process(
+    userId: string,
+    message: string,
+    workingDir?: string
+  ): Promise<string> {
+    // 取得或建立使用者的執行緒
+    let thread = this.threadManager.getByUser(userId);
+    if (!thread) {
+      thread = this.threadManager.create(userId);
+      await this.sdk.startThread(thread.id);
+    }
+
+    // 建構完整的提示訊息
+    const fullMessage = this.buildPrompt(message, workingDir);
+
+    // 更新狀態為執行中
+    this.threadManager.updateStatus(thread.id, 'running', '處理中...');
+
     try {
-      // 動態載入 Codex SDK
-      const { Codex } = await import('@openai/codex-sdk');
-      
-      if (!this.codex) {
-        this.codex = new Codex();
-      }
+      // 執行 Codex
+      const result = await this.sdk.run(thread.id, fullMessage);
 
-      let thread = this.threads.get(userId);
-      if (!thread) {
-        const codexThread = this.codex.startThread({ model: this.options.model });
-        thread = { id: codexThread.id, lastActivity: new Date() };
-        this.threads.set(userId, thread);
-      }
+      // 更新狀態為閒置
+      this.threadManager.updateStatus(thread.id, 'idle');
 
-      const codexThread = this.codex.resumeThread(thread.id);
+      // 格式化輸出
+      return this.formatOutput(result, message);
 
-      // 如果有工作目錄，先切換
-      const fullMessage = workingDir
-        ? `[在工作目錄 ${workingDir} 中執行]\n${message}`
-        : message;
-
-      const result = await codexThread.run(fullMessage, {
-        timeout: this.options.timeout,
-      });
-
-      thread.lastActivity = new Date();
-      return result.finalResponse || result.toString();
     } catch (error: any) {
-      this.logger.warn('Codex SDK 不可用，使用模擬模式', error.message);
-      
-      // 模擬模式 - 用於開發測試
-      return [
-        `*[Codex 模擬模式]*`,
-        ``,
-        `收到訊息：${message}`,
-        `工作目錄：${workingDir || '未設定'}`,
-        `模型：${this.options.model}`,
-        `超時：${this.options.timeout}ms`,
-        ``,
-        `⚠️ 請確認已安裝 Codex SDK：`,
-        `\`npm install @openai/codex-sdk\``,
-      ].join('\n');
+      this.threadManager.updateStatus(thread.id, 'error', error.message);
+
+      // SDK 不可用時使用模擬模式
+      if (!this.sdk.isAvailable()) {
+        return this.mockResponse(message, workingDir);
+      }
+
+      throw error;
     }
   }
 
+  /**
+   * 建構給 Codex 的完整提示
+   */
+  private buildPrompt(message: string, workingDir?: string): string {
+    const parts: string[] = [];
+
+    if (workingDir) {
+      parts.push(`[當前工作目錄：${workingDir}]`);
+    }
+
+    parts.push(message);
+    return parts.join('\n');
+  }
+
+  /**
+   * 格式化 Codex 輸出
+   */
+  private formatOutput(result: CodexResult, originalMessage: string): string {
+    const lines: string[] = [];
+    lines.push(result.text);
+
+    // 加入執行時間（如果超過 5 秒）
+    if (result.duration > 5000) {
+      lines.push('');
+      lines.push(`⏱️ 處理時間：${(result.duration / 1000).toFixed(1)}秒`);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * 模擬回應（用於開發測試）
+   */
+  private mockResponse(message: string, workingDir?: string): string {
+    return [
+      `*[Codex 模擬模式]*`,
+      ``,
+      `收到訊息：${message}`,
+      `工作目錄：${workingDir || '未設定'}`,
+      `模型：${this.options.model}`,
+      ``,
+      `⚠️ 請確認已安裝 Codex SDK：`,
+      `\`npm install @openai/codex-sdk\``,
+    ].join('\n');
+  }
+
   resetThread(userId: string): void {
-    this.threads.delete(userId);
-    this.logger.info(`已重設使用者 ${userId} 的 Codex 會話`);
+    this.threadManager.deleteByUser(userId);
+    this.logger.info(`已重設使用者 ${userId} 的會話`);
   }
 
   getActiveThreads(): number {
-    return this.threads.size;
+    return this.threadManager.getStats().active;
+  }
+
+  getStats() {
+    return this.threadManager.getStats();
   }
 }
